@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECOMP = os.path.join(HERE, 'recomp')
@@ -791,6 +792,33 @@ def write_lifted_sites(game, sites, build_id):
     os.replace(tmp, dst)
 
 
+def write_item_catalog(exefs, game):
+    """Build mods/item-add/items.json from the player's own RomFS (optional; Set up carries on if it is not found)."""
+    base = os.path.dirname(os.path.abspath(exefs))
+    candidates = (os.path.join(base, 'romfs'),
+                  os.path.join(base, 'updates', '131072', 'romfs'),
+                  os.path.join(os.path.dirname(base), 'updates', '131072', 'romfs'),
+                  os.path.join(game, 'nup_dump', 'updates', '131072', 'romfs'))
+    romfs = next((p for p in candidates if os.path.isfile(os.path.join(p, 'GameData', 'Item.bin'))), '')
+    if not romfs:
+        return
+    progress('catalog', 0, 1, 'Building the item catalog from your game text')
+    try:
+        sys.path.insert(0, HERE)
+        import generate_catalog
+        rows = generate_catalog.generate(Path(romfs))
+        output = os.path.join(game, 'mods', 'item-add', 'items.json')
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        temporary = output + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        os.replace(temporary, output)
+        progress('catalog', 1, 1, 'Item catalog: %d items' % len(rows))
+    except Exception:                       # a missing RomFS table or Python package must not fail Set up
+        progress('catalog', 1, 1, 'Item catalog skipped')
+
+
 def popen(cmd, **kw):
     if WINDOWS:
         kw['creationflags'] = CREATE_NO_WINDOW | BELOW_NORMAL
@@ -1159,6 +1187,9 @@ def main():
         install_exefs(stage, plain)
         write_lifted_sites(game, sites, want['main_build_id'])
         times['link'] = round(time.time() - t, 1)
+        t = time.time()
+        write_item_catalog(a.exefs, game)
+        times['catalog'] = round(time.time() - t, 1)
         if not a.keep:
             progress('finish', 0, 1, 'Removing the build files')
             for d in ('lift', 'obj', 'zig-cache', 'exefs'):
