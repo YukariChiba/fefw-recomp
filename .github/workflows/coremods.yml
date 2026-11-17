@@ -1,0 +1,108 @@
+# Core mods runtime: builds the patched fefw_rt.dll and the files a Set up needs, as an artifact of this run.
+#
+# The full packages are made by linux-release.yml. This workflow is the short path to try the Core mods port: download the artifact,
+# copy it over a matching fefw-recomp installation, and run Set up so fefw.exe is rebuilt with the new hook sites and the item catalog.
+name: Core mods
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'runtime/**'
+      - 'recomp/games/fefw/main.sites'
+      - 'game-build/fefw/**'
+      - 'game-build/release/**'
+      - 'game-build/scripts/build_fefw.ps1'
+      - '.github/workflows/coremods.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coremods-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime:
+    runs-on: windows-2022
+    env:
+      # docs/BUILDING.md: LLVM 23 or newer. The runner's own LLVM is older, so this one is unpacked into work\toolchain.
+      LLVM_VERSION: 23.1.5
+      LLVM_SHA256: b2be33385ddc86e83511417a060de927ae8b09d1f3017cc3cdce5c73cd5029d7
+      NX_JOBS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LLVM cache
+        id: llvm
+        uses: actions/cache@v4
+        with:
+          path: work/toolchain/llvm
+          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc
+
+      - name: LLVM ${{ env.LLVM_VERSION }} (clang-cl)
+        if: steps.llvm.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p work/toolchain/llvm
+          cd work/toolchain
+          curl -fsSL -o llvm.tar.zst "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/clang%2Bllvm-$LLVM_VERSION-x86_64-pc-windows-msvc.tar.zst"
+          echo "$LLVM_SHA256  llvm.tar.zst" | sha256sum -c --quiet
+          zstd -dc --long=31 llvm.tar.zst | tar -xf - -C llvm --strip-components=1 --wildcards '*/bin/*' '*/lib/clang/*'
+          rm llvm.tar.zst
+
+      - name: Toolchain paths
+        run: |
+          $bin = (Resolve-Path work\toolchain\llvm\bin).Path
+          & "$bin\clang-cl.exe" --version
+          "NX_LLVM_BIN=$bin" >> $env:GITHUB_ENV
+
+      - name: Texture transcoder sources
+        run: pwsh -File tools\textures\scripts\fetch_third_party.ps1
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      # dav1d (the AV1 movie decoder) needs NASM for its x86-64 assembly; without it the movies decode several times slower
+      - name: NASM (dav1d assembly)
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'choco install nasm failed' }
+            $dir = 'C:\Program Files\NASM'
+            if (-not (Test-Path "$dir\nasm.exe")) { throw "nasm.exe not found in $dir" }
+            $dir >> $env:GITHUB_PATH
+            $env:PATH = "$dir;$env:PATH"
+          }
+          nasm -v
+
+      - name: Runtime (fefw_rt.dll with Core mods)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+        run: pwsh -File game-build\scripts\build_fefw.ps1 -Target fefw_rt -BuildDir build\rtdll -CMakeArgs "-DFEFW_RT_DLL=ON -DNXRT_DAV1D_ASM=ON"
+
+      - name: Check the runtime files
+        run: |
+          foreach ($f in 'fefw_rt.dll', 'fefw_rt.pdb', 'fefw_rt.lib', 'fonts\DejaVuSans.ttf') {
+            if (-not (Test-Path "game-build\fefw\build\rtdll\$f")) { throw "the runtime build is missing $f" }
+          }
+
+      # The layout mirrors a release installation: copy the folder over one and run Set up.
+      - name: Stage the Core mods files
+        shell: pwsh
+        run: |
+          $rt = 'game-build\fefw\build\rtdll'
+          $dst = 'work\coremods'
+          New-Item -ItemType Directory -Force "$dst\tools\build\recomp\games\fefw", "$dst\tools\build\sdk" | Out-Null
+          Copy-Item "$rt\fefw_rt.dll" "$dst\fefw_rt.dll"
+          Copy-Item "$rt\fefw_rt.pdb" "$dst\fefw_rt.pdb"
+          Copy-Item "$rt\fefw_rt.lib" "$dst\tools\build\sdk\fefw_rt.lib"
+          Copy-Item 'recomp\games\fefw\main.sites' "$dst\tools\build\recomp\games\fefw\main.sites"
+          Copy-Item 'game-build\release\fefw_build.py' "$dst\tools\build\fefw_build.py"
+          Copy-Item 'game-build\release\generate_catalog.py' "$dst\tools\build\generate_catalog.py"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coremods-runtime-${{ github.sha }}
+          path: work/coremods
+          compression-level: 0
+          if-no-files-found: error

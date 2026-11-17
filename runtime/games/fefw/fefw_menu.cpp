@@ -17,6 +17,9 @@
 // then; nothing pretends to be live. A key set by an environment variable (NXRT_...) wins over the file: the row says so and is locked.
 #include "fefw_game.h"
 #include "fefw_presets.h"
+#include "fefw_coremods.h"
+#include "fefw_actions.h"
+#include "fefw_manual.h"
 
 #include <algorithm>
 #include <array>
@@ -76,8 +79,8 @@ const ImVec4 kGreen(0.55f, 0.86f, 0.55f, 1.0f);
 const ImVec4 kRed(1.0f, 0.42f, 0.38f, 1.0f);
 const ImVec4 kAccent(0.42f, 0.78f, 0.96f, 1.0f);
 
-enum Tab { kTabDisplay, kTabGraphics, kTabFrameRate, kTabAudio, kTabControls, kTabGame, kTabDebug, kTabCount };
-constexpr const char* kTabNames[kTabCount] = {"Display", "Graphics", "Frame rate", "Audio", "Controls", "Game", "Debug"};
+enum Tab { kTabDisplay, kTabGraphics, kTabFrameRate, kTabAudio, kTabControls, kTabGame, kTabCoreMods, kTabActions, kTabDebug, kTabCount };
+constexpr const char* kTabNames[kTabCount] = {"Display", "Graphics", "Frame rate", "Audio", "Controls", "Game", "Core mods", "Mods", "Debug"};
 
 // ---- the fefw.ini keys the menu edits -------------------------------------------------------------------------------------------------
 // The value read at start is kept (boot) so a restart-only row can show what is in force and the bottom bar can list what waits.
@@ -186,6 +189,278 @@ void notify(Menu& m, const std::string& text, bool err = false) {
     m.notice = text;
     m.notice_err = err;
     m.notice_until = ImGui::GetTime() + (err ? 8.0 : 4.0);
+}
+
+void section(const char* title);
+
+void coremods_page(Menu& m) {
+    ImGui::TextWrapped("成长、倍率和转职补正由本 PC 安装的所有存档共用；下方声望只修改当前存档。补正从下一次相关结算生效。");
+    ImGui::Spacing();
+    const char* modes[] = {"使用游戏原设置", "随机成长", "固定成长"};
+    int mode = coremods::get(coremods::Setting::GrowthMode) + 1;
+    ImGui::TextUnformatted(coremods::label(coremods::Setting::GrowthMode));
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::Combo("##growth_mode", &mode, modes, IM_ARRAYSIZE(modes))) {
+        std::string error;
+        if (!coremods::set(coremods::Setting::GrowthMode, mode - 1, &error))
+            notify(m, "Could not save growth mode: " + error, true);
+    }
+    const coremods::Setting active[] = {
+        coremods::Setting::GrowthBonus, coremods::Setting::Experience,
+        coremods::Setting::Support,
+        coremods::Setting::Mount, coremods::Setting::Weapon,
+        coremods::Setting::Skill, coremods::Setting::Fragment,
+        coremods::Setting::Money, coremods::Setting::MoveCost,
+        coremods::Setting::ClassSuccessBonus,
+        coremods::Setting::ClassLevelAdjustment,
+    };
+    for (coremods::Setting setting : active) {
+        int value = coremods::get(setting);
+        ImGui::PushID(static_cast<int>(setting));
+        ImGui::TextUnformatted(coremods::label(setting));
+        if (setting == coremods::Setting::ClassSuccessBonus) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%+d 百分点", value);
+        } else if (setting == coremods::Setting::ClassLevelAdjustment) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%+d 级", value);
+        } else if (setting == coremods::Setting::MoveCost) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%d%%（%.2f 倍）", value * 5, value / 20.0f);
+        } else if (setting != coremods::Setting::GrowthBonus) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%.1f 倍", value / 5.0f);
+        }
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        const bool changed = ImGui::SliderInt("##value", &value,
+            coremods::minimum(setting), coremods::maximum(setting));
+        if (changed) {
+            std::string error;
+            if (!coremods::set(setting, value, &error)) notify(m, "Could not save setting: " + error, true);
+        }
+        if (setting == coremods::Setting::Experience)
+            ImGui::TextDisabled("仅调整我方人物原本为正的等级经验；等级上限仍由游戏处理。");
+        if (setting == coremods::Setting::MoveCost)
+            ImGui::TextDisabled("只改变大地图移动消耗的回合；不足一回合的部分记在当前存档，后续移动继续累计。0%% 为不消耗回合。");
+        if (setting == coremods::Setting::ClassSuccessBonus)
+            ImGui::TextDisabled("%s", "原成功率加减百分点，结果限制在 0～100%；无效资格仍按游戏原规则处理。");
+        if (setting == coremods::Setting::ClassLevelAdjustment)
+            ImGui::TextDisabled("调整考试成功率计算使用的等级基准；页面“推荐LV”仍显示原版数值。");
+        if (setting == coremods::Setting::ClassLevelAdjustment)
+            ImGui::TextDisabled("名声等级等报名条件保持原规则。");
+        ImGui::PopID();
+    }
+    bool special_count = coremods::get(coremods::Setting::SpecialClassCount) != 0;
+    if (ImGui::Checkbox("解除特殊职业人数限制", &special_count)) {
+        std::string error;
+        if (!coremods::set(coremods::Setting::SpecialClassCount, special_count ? 1 : 0, &error))
+            notify(m, "Could not save special class setting: " + error, true);
+    }
+    ImGui::TextDisabled("仅适用于已有我方角色取得资格的特殊职业；保留凭证，不重复发证。默认关闭。");
+    ImGui::Spacing();
+    section("招募门槛");
+    bool recruit_level_one = coremods::get(coremods::Setting::RecruitLevelOne) != 0;
+    if (ImGui::Checkbox("新入队角色从 1 级培养", &recruit_level_one)) {
+        std::string error;
+        if (!coremods::set(coremods::Setting::RecruitLevelOne, recruit_level_one ? 1 : 0, &error))
+            notify(m, "无法保存入队等级设置：" + error, true);
+    }
+    ImGui::TextDisabled("只影响开启后首次加入的新队员；已有队员和旧存档不降级。默认关闭。");
+    ImGui::Spacing();
+    section("无限消耗开关");
+    const coremods::Setting unlimited[] = {
+        coremods::Setting::InfiniteWeapons, coremods::Setting::InfiniteMagic,
+        coremods::Setting::InfiniteMedicine, coremods::Setting::InfiniteFood,
+    };
+    const int switch_columns = ImGui::GetContentRegionAvail().x >= 680.0f ? 2 : 1;
+    if (ImGui::BeginTable("unlimited_switches", switch_columns, ImGuiTableFlags_SizingStretchSame)) {
+        for (coremods::Setting setting : unlimited) {
+            ImGui::TableNextColumn();
+            bool enabled = coremods::get(setting) != 0;
+            ImGui::PushID(static_cast<int>(setting));
+            if (ImGui::Checkbox(coremods::label(setting), &enabled)) {
+                std::string error;
+                if (!coremods::set(setting, enabled ? 1 : 0, &error))
+                    notify(m, "Could not save switch: " + error, true);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("药品仅限普通回复、解毒及加护道具；食材不含鱼饵、试供种和任务物品。");
+    ImGui::TextDisabled("开关默认关闭；请在独立测试存档逐项验证消耗和存档读回。");
+    ImGui::Spacing();
+    section("活动快捷与完美评价");
+    const coremods::Setting activities[] = {
+        coremods::Setting::QuickBird, coremods::Setting::QuickMeal,
+        coremods::Setting::QuickTraining, coremods::Setting::QuickCapture,
+        coremods::Setting::QuickService, coremods::Setting::PerfectExplore,
+    };
+    const int activity_columns = ImGui::GetContentRegionAvail().x >= 1050.0f ? 3 : switch_columns;
+    if (ImGui::BeginTable("quick_activities", activity_columns, ImGuiTableFlags_SizingStretchSame)) {
+        for (coremods::Setting setting : activities) {
+            ImGui::TableNextColumn();
+            bool enabled = coremods::get(setting) != 0;
+            ImGui::PushID(static_cast<int>(setting));
+            if (ImGui::Checkbox(coremods::label(setting), &enabled)) {
+                std::string error;
+                if (!coremods::set(setting, enabled ? 1 : 0, &error))
+                    notify(m, "Could not save activity switch: " + error, true);
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("仍需按游戏规则选择活动并支付费用或材料；野外探索只改变评价。默认关闭。");
+    if (ImGui::BeginTable("activity_rules", switch_columns, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        bool unlimited_weekly = coremods::get(coremods::Setting::UnlimitedWeeklyActivities) != 0;
+        if (ImGui::Checkbox("训练、用餐、侍奉和送礼不限每周次数", &unlimited_weekly)) {
+            std::string error;
+            if (!coremods::set(coremods::Setting::UnlimitedWeeklyActivities, unlimited_weekly ? 1 : 0, &error))
+                notify(m, "无法保存每周次数设置：" + error, true);
+        }
+        ImGui::TableNextColumn();
+        bool preserve_flames = coremods::get(coremods::Setting::PreserveActivityFlames) != 0;
+        if (ImGui::Checkbox("角色每周三格活动次数不消耗", &preserve_flames)) {
+            std::string error;
+            if (!coremods::set(coremods::Setting::PreserveActivityFlames, preserve_flames ? 1 : 0, &error))
+                notify(m, "无法保存角色活动次数设置：" + error, true);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextDisabled("活动仍扣费用和材料；已用掉的角色次数不会补回。默认关闭。");
+    ImGui::Spacing();
+    section("手动存档栏位");
+    bool ten_slots = config_get_int("coremods", "manual_slots", 0) == 1;
+    if (ImGui::Checkbox("启用十个手动存档栏位", &ten_slots)) {
+        std::string error;
+        if (config_write("coremods", "manual_slots", ten_slots ? "1" : "0", &error))
+            notify(m, "存档栏位设置已保存；重启游戏后生效。");
+        else
+            notify(m, "无法保存存档栏位设置：" + error, true);
+    }
+    if (ten_slots != manual::enabled())
+        ImGui::TextDisabled("当前仍按重启前的设置运行；请先退出游戏，再重新启动。");
+    ImGui::TextDisabled("关闭后额外的手动存档不会被删除；重新开启并重启后可再次看到。");
+    ImGui::Spacing();
+    section("原生系统菜单");
+    bool native_quit = config_get_int("coremods", "native_quit", 0) == 1;
+    if (ImGui::Checkbox("显示结束游戏选项", &native_quit)) {
+        std::string error;
+        if (config_write("coremods", "native_quit", native_quit ? "1" : "0", &error))
+            notify(m, "结束游戏选项设置已保存；重启游戏后生效。");
+        else
+            notify(m, "无法保存结束游戏选项设置：" + error, true);
+    }
+    ImGui::TextDisabled("在游戏内系统菜单显示结束游戏；选择后需再次确认。默认关闭。");
+    ImGui::Spacing();
+    ImGui::TextUnformatted("当前存档声望");
+    if (!coremods::renown_available()) {
+        ImGui::TextDisabled("读取存档后可调整声望。");
+    } else {
+        const int cap = coremods::renown_cap();
+        int value = coremods::renown_current();
+        ImGui::Text("%d / %d", value, cap);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::SliderInt("##renown", &value, 0, cap)) coremods::set_renown(value);
+        static int step_index = 1;
+        const int steps[] = {1, 10, 100, 1000};
+        const char* step_labels[] = {"1", "10", "100", "1000"};
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::Combo("声望步长", &step_index, step_labels, IM_ARRAYSIZE(step_labels));
+        if (ImGui::Button("减少声望")) coremods::set_renown(coremods::renown_current() - steps[step_index]);
+        ImGui::SameLine();
+        if (ImGui::Button("增加声望")) coremods::set_renown(coremods::renown_current() + steps[step_index]);
+        ImGui::TextDisabled("仅修改当前存档的声望，最高为游戏在当前章节允许的上限。");
+    }
+}
+
+void actions_page(Menu& m) {
+    static char search[256]{};
+    static char iid[256]{};
+    static int quantity = 1, gift_amount = 500;
+    static int category = -1;
+    constexpr std::array<const char*, 6> category_names = {
+        "武器", "烹饪材料", "强化材料", "礼物", "经验书与属性道具", "其他"};
+    const auto& catalog = actions::item_catalog();
+    section("添加物品");
+    ImGui::TextWrapped("选择分类与物品，再购买或拾取一件普通物品来触发添加。任务物品请谨慎添加。");
+    if (catalog.empty()) ImGui::TextDisabled("物品目录不可用：mods/item-add/items.json");
+    if (category >= 0) {
+        if (ImGui::Button("返回分类")) { category = -1; search[0] = '\0'; }
+        if (category >= 0) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted(category_names[category]);
+        }
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##item_search", "搜索中文、日文名称或 IID；在分类首页搜索全部物品", search, sizeof(search));
+    const bool browsing = category >= 0 || search[0] != '\0';
+    if (!browsing) {
+        std::array<int, category_names.size()> counts{};
+        for (const auto& item : catalog) ++counts[static_cast<size_t>(item.category)];
+        for (size_t i = 0; i < category_names.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            const std::string label = std::string(category_names[i]) + " (" + std::to_string(counts[i]) + ")";
+            if (ImGui::Button(label.c_str(), ImVec2(px(280), 0))) category = static_cast<int>(i);
+            if (i % 2 == 0 && i + 1 < category_names.size()) ImGui::SameLine();
+            ImGui::PopID();
+        }
+        ImGui::TextDisabled("共 %zu 件；也可以在上方直接搜索全部物品。", catalog.size());
+    } else {
+        std::string needle = search;
+        std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::vector<const actions::Item*> matches;
+        matches.reserve(catalog.size());
+        for (const auto& item : catalog) {
+            if (category >= 0 && static_cast<int>(item.category) != category) continue;
+            if (!needle.empty()) {
+                std::string haystack = item.search_text;
+                std::transform(haystack.begin(), haystack.end(), haystack.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (haystack.find(needle) == std::string::npos) continue;
+            }
+            matches.push_back(&item);
+        }
+        ImGui::TextDisabled("找到 %zu 件物品", matches.size());
+        if (ImGui::BeginChild("##item_results", ImVec2(0, px(240)), ImGuiChildFlags_Borders)) {
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(matches.size()));
+            while (clipper.Step()) {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                    const auto& item = *matches[i];
+                    ImGui::PushID(item.iid.c_str());
+                    const std::string label = (item.name.empty() ? item.iid : item.name) +
+                        "  (" + item.iid + ")";
+                    if (ImGui::Selectable(label.c_str(), std::strcmp(iid, item.iid.c_str()) == 0))
+                        std::snprintf(iid, sizeof(iid), "%s", item.iid.c_str());
+                    ImGui::PopID();
+                }
+            }
+        }
+        ImGui::EndChild();
+    }
+    ImGui::InputText("物品编号（IID）", iid, sizeof(iid));
+    ImGui::InputInt("数量", &quantity);
+    quantity = std::clamp(quantity, 1, 500);
+    ImGui::TextDisabled("按所选数量添加，最多 500；游戏自身的奖励不受影响。任务物品请只添加所需数量。");
+    if (ImGui::Button("下次获得物品时添加")) {
+        if (!actions::queue_item(iid, quantity)) notify(m, "请先选择有效的物品编号和数量。", true);
+        else notify(m, "物品已排队等待添加。");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消添加物品")) actions::cancel_item();
+    ImGui::TextWrapped("%s", actions::item_status().c_str());
+
+    section("下次送礼支援值");
+    ImGui::InputInt("送礼获得的支援值", &gift_amount);
+    gift_amount = std::clamp(gift_amount, 1, 50000);
+    if (ImGui::Button("应用于下次送礼")) {
+        if (actions::queue_gift(gift_amount)) notify(m, "送礼支援值调整已排队。");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("取消送礼调整")) actions::cancel_gift();
+    ImGui::TextWrapped("%s", actions::gift_status().c_str());
 }
 
 std::string ini_now(const IniKey& k) { return config_get_str(k.sec, k.key, k.def); }
@@ -1712,6 +1987,8 @@ void settings_menu(play::UiHost& host, gfx::Overlay& ov) {
                     case kTabAudio: audio_page(host, m); break;
                     case kTabControls: controls_page(host, m, live); break;
                     case kTabGame: game_page(host, m); break;
+                    case kTabCoreMods: coremods_page(m); break;
+                    case kTabActions: actions_page(m); break;
                     case kTabDebug: debug_page(host, m, ov); break;
                 }
                 ImGui::PopItemWidth();
